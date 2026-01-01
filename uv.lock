@@ -518,6 +518,11 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl", hash = "sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad", size = 73517 },
 ]
 
+[package.optional-dependencies]
+socks = [
+    { name = "socksio" },
+]
+
 [[package]]
 name = "idna"
 version = "3.11"
@@ -794,6 +799,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "google-auth" },
     { name = "gspread" },
+    { name = "httpx", extra = ["socks"] },
     { name = "langchain" },
     { name = "langchain-google-genai" },
     { name = "langchain-groq" },
@@ -823,6 +829,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "google-auth", specifier = ">=2.45.0" },
     { name = "gspread", specifier = ">=6.2.1" },
+    { name = "httpx", extras = ["socks"], specifier = ">=0.28.1" },
     { name = "langchain", specifier = ">=0.3.0" },
     { name = "langchain-google-genai", specifier = ">=2.0.0" },
     { name = "langchain-groq", specifier = ">=0.2.0" },

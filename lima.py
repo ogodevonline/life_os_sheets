@@ -1,29 +1,27 @@
-import argparse
-import asyncio
-import json
-import logging
-import math
 import os
-from typing import List, Dict, Any, Union
-
 import pandas as pd
+from datetime import date
+from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 
-try:
-    import matplotlib.pyplot as plt
-    HAS_MATPLOTLIB = True
-except Exception:
-    HAS_MATPLOTLIB = False
-
-from langchain.messages import HumanMessage
-from langchain_core.prompts import PromptTemplate
-from langchain_google_genai import ChatGoogleGenerativeAI
-
+# --- НАСТРОЙКИ ---
 load_dotenv()
+START_DATE = date(2025, 1, 1)  # Начало симуляции
+START_CAPITAL = 150000         # Стартовый капитал
+SALARY_SAVE = 100000           # Ежемесячное пополнение
+MONTHS_TO_SIMULATE = 12        # Горизонт планирования
+BASE_RATE = 0.16               # Начальная ставка (16%)
+RATE_DROP_STEP = 0.003         # Шаг снижения ставки в месяц
 
-print("✅ Импорты загружены")
+# 2. АГРЕССИВНАЯ ОЧИСТКА: Удаляем все старые настройки прокси,
+# которые могли прилететь из .env или системы.
+# Это удалит тот самый "socks://127.0.0.1:12334", который вызывает ошибку.
+for key in list(os.environ.keys()):
+    if "proxy" in key.lower():
+        del os.environ[key]
 
-# Используем HTTP прокси (который конвертирует в SOCKS5)
+# 3. Настраиваем подключение ТОЛЬКО через твой локальный HTTP-мост
+# Твой мост: http://127.0.0.1:8888 -> socks5://127.0.0.1:12334
 http_proxy = "http://127.0.0.1:8888"
 
 os.environ["HTTP_PROXY"] = http_proxy
@@ -31,350 +29,366 @@ os.environ["HTTPS_PROXY"] = http_proxy
 os.environ["http_proxy"] = http_proxy
 os.environ["https_proxy"] = http_proxy
 
-print(f"🌐 Используется HTTP прокси (конвертирует SOCKS5): {http_proxy}")
+print(f"🌐 Прокси жестко переопределен на мост: {http_proxy}")
 
-# Очистка старых прокси переменных
-for key in ['ALL_PROXY', 'all_proxy', 'GROQ_PROXY']:
-    os.environ.pop(key, None)
+import argparse
+parser = argparse.ArgumentParser(description="Investment strategy simulator")
+parser.add_argument('--llm', choices=['groq', 'gemini'], help="Choose LLM: groq or gemini")
+args = parser.parse_args()
 
-# Инициализация LangChain модели
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-if gemini_api_key:
-    llm = ChatGoogleGenerativeAI(
-        google_api_key=gemini_api_key,
-        model="gemini-3-flash-preview",
-        temperature=0.3,
-        max_retries=1,
-        request_timeout=60,
-    )
+# Попытка импорта AI (опционально)
+try:
+    from langchain.messages import HumanMessage
+    from langchain_groq import ChatGroq
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    groq_api_key = os.getenv("GROQ_API_KEY")
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    HAS_AI = bool(groq_api_key or gemini_api_key)
+except ImportError:
+    HAS_AI = False
 
-    try:
-        print("🔄 Отправка запроса через HTTP→SOCKS5 прокси...")
-        res = llm.invoke([HumanMessage(content="Test")])
-        print("✅ TEST RESULT:", res.content)
-        ai_available = True
-    except Exception as e:
-        print(f"❌ ERROR: {e}")
-        ai_available = False
-else:
-    print("⚠️ GEMINI_API_KEY not found, skipping AI analysis")
-    ai_available = False
+print("✅ Скрипт запущен. Расчет по точным датам...")
 
-def calculate_only_deposits():
-    # начальные данные
-    salary_save = 100000
-    start_sum = 150000
-    months = 12
-    rate = 0.16  # текущая ставка
+def get_rate(month_idx):
+    """Возвращает ставку, снижающуюся каждый месяц"""
+    r = BASE_RATE - (month_idx * RATE_DROP_STEP)
+    return max(0.01, r)
+
+def simulate_strategy_deposits_only():
+    """
+    Стратегия 1: Все деньги только на вклады.
+    Старт: 150к на 5 месяцев.
+    Далее: 100к каждый месяц (начиная с 1 февраля).
+    """
+    current_date = START_DATE
+    # Список активных вкладов: {'amount': float, 'end_date': date, 'rate': float}
+    active_deposits = []
     
-    # Стартовый капитал (150к) — считаем его уже лежащим на вкладе
-    deposits = [[start_sum, 0, 5, 0.16]] 
-    
+    # История операций для таблицы
     history = []
-    total_profit = 0
-    total_invested = start_sum # Начинаем со 150к
-
-    for m in range(months):
-        # 1. Добавляем ежемесячное пополнение 100к (теперь с первого месяца m=0)
-        deposits.append([salary_save, m, 3, rate])
-        total_invested += salary_save
+    
+    # Накопительные переменные
+    total_invested_own = 0
+    accumulated_profit_cash = 0 # Выплаченные проценты, которые лежат на счете/реинвестируются
+    
+    # 1. СТАРТ (01.01)
+    # Вкладываем 150к на 5 месяцев
+    active_deposits.append({
+        'amount': START_CAPITAL,
+        'end_date': current_date + relativedelta(months=5),
+        'rate': BASE_RATE,
+        'name': 'Стартовый'
+    })
+    total_invested_own += START_CAPITAL
+    
+    # Цикл по месяцам (0..11)
+    for m in range(MONTHS_TO_SIMULATE + 1): # +1 чтобы захватить итог на начало следующего года
+        current_date = START_DATE + relativedelta(months=m)
+        events_log = []
         
-        # 2. Проверяем, какие вклады закрылись в этом месяце
-        active_deposits = []
-        monthly_profit = 0
+        # А) Проверка закрытия вкладов (утро месяца)
+        profit_this_month = 0
+        liquidity_pool = 0 # Деньги от закрытых вкладов + прибыль
         
-        for d in deposits:
-            sum_val, start_m, duration, d_rate = d
-            # Проверка закрытия
-            if m == start_m + duration:
-                profit = sum_val * (d_rate * duration / 12)
-                monthly_profit += profit
-                # Реинвестируем тело + проценты на новый срок (3 мес)
-                active_deposits.append([sum_val + profit, m, 3, rate])
+        still_active = []
+        for dep in active_deposits:
+            if dep['end_date'] <= current_date:
+                # Вклад закрылся
+                term_months = (dep['end_date'].year - (dep['end_date'] - relativedelta(months=5)).year) * 12 + dep['end_date'].month - (dep['end_date'] - relativedelta(months=5)).month 
+                # Упрощенно берем срок из свойств или вычисляем разницу, здесь для точности:
+                # Считаем доход: Сумма * Ставка * (Срок/12)
+                # Важно: тут мы знаем срок. Для стартового 5 мес, для остальных 3 мес.
+                # Чтобы не усложнять, пересчитаем срок по факту разницы дат, но для простоты кода используем фиксированные типы 5 и 3.
+                
+                duration = 5 if dep['name'] == 'Стартовый' else 3
+                profit = dep['amount'] * (dep['rate'] * duration / 12)
+                
+                profit_this_month += profit
+                liquidity_pool += (dep['amount'] + profit)
+                events_log.append(f"💰 Закрыт вклад ({dep['name']}): +{int(profit)} руб.")
             else:
-                active_deposits.append(d)
+                still_active.append(dep)
         
-        deposits = active_deposits
-        total_profit += monthly_profit
-        current_total = total_invested + total_profit
+        active_deposits = still_active
+        accumulated_profit_cash += profit_this_month
+        
+        # Б) Пополнение зарплатой (только если это не 0-й месяц)
+        salary_added = 0
+        if m > 0 and m < 12: # Зарплата приходит с февраля по декабрь
+            salary_added = SALARY_SAVE
+            liquidity_pool += salary_added
+            total_invested_own += salary_added
+            events_log.append(f"📥 Зарплата: +{salary_added}")
+
+        # В) Реинвестирование (открытие новых вкладов)
+        # Если есть деньги в пуле (от закрытия или зарплаты), открываем новый вклад на 3 мес
+        if liquidity_pool > 0 and m < 12:
+            new_rate = get_rate(m)
+            active_deposits.append({
+                'amount': liquidity_pool,
+                'end_date': current_date + relativedelta(months=3),
+                'rate': new_rate,
+                'name': f"От {current_date.strftime('%b')}"
+            })
+            events_log.append(f"🆕 Новый вклад: {int(liquidity_pool)} руб. под {new_rate*100:.1f}% на 3 мес.")
+            liquidity_pool = 0 # Все вложили
+
+        # Расчет итогов на текущую дату
+        total_in_deposits = sum(d['amount'] for d in active_deposits)
+        total_capital = total_in_deposits + liquidity_pool # liquidity_pool должен быть 0, если все вложили
         
         history.append({
-            "месяц": m + 1,
-            "вложено своих": total_invested,
-            "капитал на вкладах": round(current_total, 2),
-            "прибыль (выплаты)": round(monthly_profit, 2),
-            "текущая ставка": f"{round(rate*100, 1)}%"
+            "Дата": current_date.strftime("%d.%m.%Y"),
+            "Своих вложено": total_invested_own,
+            "Капитал": round(total_capital, 0),
+            "Прибыль (накопл.)": round(accumulated_profit_cash, 0),
+            "События": "; ".join(events_log) if events_log else "—"
         })
-        
-        # Плавное снижение ставки ЦБ на 0.3%
-        rate -= 0.003
 
     return pd.DataFrame(history)
 
-
-def summarize_strategy(df: pd.DataFrame, invested_col: str, capital_col: str, profit_col: str, months: int):
-    """Возвращает словарь с ключевыми метриками по стратегии."""
-    invested = float(df.iloc[-1][invested_col])
-    ending = float(df.iloc[-1][capital_col])
-    # profit column may be either per-period or cumulative; try to detect
-    try:
-        total_profit = float(df[profit_col].iloc[-1])
-    except Exception:
-        total_profit = float(df[profit_col].sum())
-
-    roi = (ending - invested) / invested if invested != 0 else float('nan')
-    years = months / 12.0
-    try:
-        cagr = (ending / invested) ** (1 / years) - 1 if invested > 0 and years > 0 else float('nan')
-    except Exception:
-        cagr = float('nan')
-
-    return {
-        "invested": invested,
-        "ending_capital": ending,
-        "total_profit": total_profit,
-        "roi": roi,
-        "cagr": cagr,
-        "months": months,
-    }
-
-def calculate_fixed_threshold_strategy():
-    start_sum = 150000
-    monthly_save = 100000
-    months = 12
-    rate_vklad = 0.16
-    
-    # Стартовый Сбер (150к) уже в списке
-    vklads = [[start_sum, 0, 5, 0.16]] 
+def simulate_strategy_mixed():
+    """
+    Стратегия 2: Вклады + ИИС.
+    Старт (01.01): 150к во Вклад (5 мес).
+    Далее чередуем:
+      - Февраль (ЗП #1): Вклад (чтобы поддержать ликвидность)
+      - Март (ЗП #2): ИИС (ОФЗ)
+      - Апрель (ЗП #3): Вклад
+      ...
+    """
+    current_date = START_DATE
+    vklads = [] # List of dicts
     iis_balance = 0
-    total_invested = start_sum # Начинаем со 150к базовых
-    total_profit_cash = 0
+    
+    total_invested_own = 0
+    accumulated_profit = 0
     
     history = []
     
-    for m in range(months):
-        # 1. Пополнение происходит КАЖДЫЙ месяц (начиная с m=0)
-        total_invested += monthly_save
+    # 1. СТАРТ (01.01)
+    vklads.append({
+        'amount': START_CAPITAL,
+        'end_date': current_date + relativedelta(months=5),
+        'rate': BASE_RATE,
+        'name': 'Стартовый'
+    })
+    total_invested_own += START_CAPITAL
+    
+    salary_counter = 0 # Счетчик зарплат для чередования
+    
+    for m in range(MONTHS_TO_SIMULATE + 1):
+        current_date = START_DATE + relativedelta(months=m)
+        events_log = []
+        current_rate = get_rate(m)
         
-        # Чередуем: месяц вклад, месяц ИИС
-        if m % 2 == 0:
-            # В 1-й месяц (m=0) докладываем 100к во вклады
-            vklads.append([monthly_save, m, 3, rate_vklad])
-        else:
-            # Во 2-й месяц (m=1) отправляем 100к на ИИС
-            iis_balance += monthly_save
-        
-        # 2. Обслуживание вкладов (проверка закрытия и реинвест)
+        # --- 1. Обработка Вкладов (закрытие) ---
+        liquid_cash = 0
         new_vklads = []
         monthly_profit_vklad = 0
+        
         for v in vklads:
-            v_sum, v_start, v_dur, v_rate = v
-            if m == v_start + v_dur:
-                p = v_sum * (v_rate * v_dur / 12)
-                monthly_profit_vklad += p
-                # Реинвестируем тело + проценты
-                new_vklads.append([v_sum + p, m, 3, rate_vklad])
+            if v['end_date'] <= current_date:
+                duration = 5 if v['name'] == 'Стартовый' else 3
+                prof = v['amount'] * (v['rate'] * duration / 12)
+                monthly_profit_vklad += prof
+                liquid_cash += (v['amount'] + prof)
+                events_log.append(f"💰 Вклад закрыт: +{int(prof)}")
             else:
                 new_vklads.append(v)
         vklads = new_vklads
-        total_profit_cash += monthly_profit_vklad
+        accumulated_profit += monthly_profit_vklad
         
-        # 3. Купоны по ОФЗ (начисляются на текущий баланс ИИС)
-        monthly_coupon = iis_balance * (0.15 / 12)
-        total_profit_cash += monthly_coupon
+        # --- 2. Купоны по ИИС (каждый месяц упрощенно капает 15% годовых / 12) ---
+        # Считаем, что купоны реинвестируются обратно в ИИС или падают на счет.
+        # Для чистоты сравнения: купоны падают на ИИС и увеличивают базу.
+        iis_income = iis_balance * (0.15 / 12)
+        if iis_balance > 0:
+            iis_balance += iis_income
+            accumulated_profit += iis_income
+            # events_log.append(f"📈 Купон ИИС: {int(iis_income)}") # Слишком много спама, скрываем
+            
+        # --- 3. Зарплата и Распределение ---
+        if m > 0 and m < 12:
+            salary_counter += 1
+            total_invested_own += SALARY_SAVE
+            
+            # Логика чередования: Нечетные (1-я, 3-я зп) -> Вклад, Четные -> ИИС
+            # 1 фев (ЗП1) -> Вклад
+            # 1 мар (ЗП2) -> ИИС
+            if salary_counter % 2 != 0:
+                # Добавляем во Вклад
+                amount_to_dep = SALARY_SAVE
+                # Если были закрытые вклады (liquid_cash), добавляем их тоже сюда
+                amount_to_dep += liquid_cash
+                liquid_cash = 0 
+                
+                vklads.append({
+                    'amount': amount_to_dep,
+                    'end_date': current_date + relativedelta(months=3),
+                    'rate': current_rate,
+                    'name': f"Вкл-{current_date.month}"
+                })
+                events_log.append(f"🏦 Вклад (+ЗП): {int(amount_to_dep)}")
+            else:
+                # Добавляем на ИИС
+                iis_balance += SALARY_SAVE
+                events_log.append(f"🏛️ ИИС (+ЗП): {SALARY_SAVE}")
+                
+                # А что делать с закрывшимися вкладами (liquid_cash)? 
+                # Стратегия: Держим на коротких вкладах, не переводим на ИИС (чтобы можно было снять)
+                if liquid_cash > 0:
+                    vklads.append({
+                        'amount': liquid_cash,
+                        'end_date': current_date + relativedelta(months=3),
+                        'rate': current_rate,
+                        'name': f"Реинвест-{current_date.month}"
+                    })
+                    events_log.append(f"🔄 Реинвест вклада: {int(liquid_cash)}")
+                    liquid_cash = 0
         
-        # 4. Расчет итогов месяца
-        current_vklad_total = sum(v[0] for v in vklads)
-        
-        # Рост тела ОФЗ (+8%) и вычет (52к) в конце года (декабрь, m=11)
-        current_iis_value = iis_balance
-        if m == 11:
-            current_iis_value += iis_balance * 0.08
-            total_profit_cash += 52000 # Налоговый вычет
-        
+        # Если это 0-й месяц или 13-й, но есть liquid_cash (например, реинвест стартового)
+        if liquid_cash > 0 and m < 12:
+             vklads.append({
+                'amount': liquid_cash,
+                'end_date': current_date + relativedelta(months=3),
+                'rate': current_rate,
+                'name': f"Реинвест-{current_date.month}"
+            })
+             events_log.append(f"🔄 Реинвест: {int(liquid_cash)}")
+
+        # --- 4. Финиш года (Налоговый вычет и переоценка тела облигаций) ---
+        # Допустим, 1 января следующего года мы получаем право на вычет и тело облигаций выросло
+        if m == 12: 
+            # Налоговый вычет (макс 52к или 13% от взносов). Взносы примерно 500-600к
+            tax_deduction = min(52000, (iis_balance * 0.13)) # Грубая оценка от баланса
+            # Рост тела облигаций (допустим 8% годовых, но они лежали не весь год).
+            # Упростим: единоразовая переоценка в конце + вычет
+            accumulated_profit += tax_deduction
+            events_log.append(f"✅ Налоговый вычет: +{int(tax_deduction)}")
+            # (Тело прибавляем к "Капиталу", но в "Прибыль" идет только дельта)
+            
+            # Прибавляем вычет к капиталу (как будто получили кэш)
+            # В таблице покажем это увеличением общего капитала
+            # Для корректности добавим к accumulated_profit
+            pass
+
+        vklad_sum = sum(v['amount'] for v in vklads)
+        total_capital = vklad_sum + iis_balance + (52000 if m == 12 else 0) # Добавляем вычет вручную в капитал в конце
+
         history.append({
-            "Месяц": m + 1,
-            "Вложено своих": total_invested,
-            "На вкладах": round(current_vklad_total, 0),
-            "На ИИС (ОФЗ)": round(current_iis_value, 0),
-            "Общий капитал": round(current_vklad_total + current_iis_value, 0),
-            "Накопленная прибыль": round(total_profit_cash, 0)
+            "Дата": current_date.strftime("%d.%m.%Y"),
+            "Своих вложено": total_invested_own,
+            "На вкладах": int(vklad_sum),
+            "На ИИС": int(iis_balance),
+            "Капитал": int(total_capital),
+            "События": "; ".join(events_log) if events_log else "—"
         })
         
-        # Плавное снижение ставки
-        rate_vklad -= 0.003
-
     return pd.DataFrame(history)
-df1 = calculate_only_deposits()
-print("СТРАТЕГИЯ 1: ТОЛЬКО ВКЛАДЫ")
-print(df1.to_string(index=False))
 
-df_fixed = calculate_fixed_threshold_strategy()
-print("\nСТРАТЕГИЯ 2: ВКЛАДЫ + ИИС С ВЫЧЕТОМ")
-print(df_fixed.to_string(index=False))
+# --- ЗАПУСК ---
 
-# Итоги
-print("\n📊 ИТОГИ:")
-print(f"Стратегия 1: Вложено {df1.iloc[-1]['вложено своих']}, Капитал {df1.iloc[-1]['капитал на вкладах']}, Общая прибыль {df1['прибыль (выплаты)'].sum()}")
-print(f"Стратегия 2: Вложено {df_fixed.iloc[-1]['Вложено своих']}, Капитал {df_fixed.iloc[-1]['Общий капитал']}, Общая прибыль {df_fixed.iloc[-1]['Накопленная прибыль']}")
+print(f"\n🗓 ПАРАМЕТРЫ:")
+print(f"Старт: {START_DATE}, Сумма: {START_CAPITAL}, ЗП: {SALARY_SAVE} (с 1 февраля)")
+print("-" * 60)
 
-# Генерация отчета в Markdown
-df1_md = df1.copy()
-df1_md = df1_md.round(2)
-df1_md['капитал на вкладах'] = df1_md['капитал на вкладах'].apply(lambda x: f"{x:.2f}")
-df1_md['прибыль (выплаты)'] = df1_md['прибыль (выплаты)'].apply(lambda x: f"{x:.2f}")
+df1 = simulate_strategy_deposits_only()
+df2 = simulate_strategy_mixed()
 
-df_fixed_md = df_fixed.copy()
-df_fixed_md = df_fixed_md.round(0)
-df_fixed_md['Вложено своих'] = df_fixed_md['Вложено своих'].apply(lambda x: f"{x:.0f}")
-df_fixed_md['На вкладах'] = df_fixed_md['На вкладах'].apply(lambda x: f"{x:.0f}")
-df_fixed_md['На ИИС (ОФЗ)'] = df_fixed_md['На ИИС (ОФЗ)'].apply(lambda x: f"{x:.0f}")
-df_fixed_md['Общий капитал'] = df_fixed_md['Общий капитал'].apply(lambda x: f"{x:.0f}")
-df_fixed_md['Накопленная прибыль'] = df_fixed_md['Накопленная прибыль'].apply(lambda x: f"{x:.0f}")
+# Вывод таблиц
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
 
-with open("report.md", "w", encoding="utf-8") as f:
-    f.write("# Инвестиционный отчет: Сравнение стратегий\n\n")
-    f.write("Дата генерации: " + pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
+print("\n🔵 СТРАТЕГИЯ 1: ТОЛЬКО ВКЛАДЫ")
+print(df1[['Дата', 'Своих вложено', 'Капитал', 'Прибыль (накопл.)', 'События']].to_string(index=False))
+
+print("\n🟠 СТРАТЕГИЯ 2: СМЕШАННАЯ (Вклады + ИИС)")
+print(df2[['Дата', 'Своих вложено', 'На вкладах', 'На ИИС', 'Капитал', 'События']].to_string(index=False))
+
+# Сохранение в файл
+with open("detailed_report.md", "w", encoding="utf-8") as f:
+    f.write("# Детальный расчет инвестиций\n\n")
+    f.write("## Стратегия 1: Каскад вкладов\n")
+    f.write(df1.to_markdown(index=False))
+    f.write("\n\n## Стратегия 2: Вклады + ИИС\n")
+    f.write(df2.to_markdown(index=False))
+
+print(f"\n💾 Полный отчет сохранен в detailed_report.md")
+
+# AI Анализ (если доступен ключ)
+if HAS_AI:
+    print("\n🧠 Запрос к AI для выводов...")
+    chosen_llm = args.llm
+    if chosen_llm == 'groq':
+        if groq_api_key:
+            llm = ChatGroq(api_key=groq_api_key, model="qwen/qwen3-32b")
+        else:
+            print("GROQ_API_KEY not set, skipping AI")
+            HAS_AI = False
+    elif chosen_llm == 'gemini':
+        if gemini_api_key:
+            llm = ChatGoogleGenerativeAI(google_api_key=gemini_api_key, model="gemini-3-flash-preview")
+        else:
+            print("GEMINI_API_KEY not set, skipping AI")
+            HAS_AI = False
+    else:
+        # default: try groq first, then gemini
+        if groq_api_key:
+            llm = ChatGroq(api_key=groq_api_key, model="qwen/qwen3-32b")
+        elif gemini_api_key:
+            llm = ChatGoogleGenerativeAI(google_api_key=gemini_api_key, model="gemini-3-flash-preview")
+        else:
+            HAS_AI = False
     
-    f.write("## Стратегия 1: Только вклады\n\n")
-    f.write(df1_md.to_markdown(index=False) + "\n\n")
+    # Подготовка промпта с новыми данными
+    final_s1 = df1.iloc[-1]
+    final_s2 = df2.iloc[-1]
     
-    f.write("## Стратегия 2: Вклады + ИИС с налоговым вычетом\n\n")
-    f.write(df_fixed_md.to_markdown(index=False) + "\n\n")
+    prompt = f"""
+    Сравни две стратегии накопления на 1 год (2025).
     
-    f.write("## Итоги\n\n")
-    f.write(f"- **Стратегия 1**: Вложено {df1.iloc[-1]['вложено своих']}, Капитал {df1.iloc[-1]['капитал на вкладах']:.2f}, Общая прибыль {df1['прибыль (выплаты)'].sum():.2f}\n")
-    f.write(f"- **Стратегия 2**: Вложено {df_fixed.iloc[-1]['Вложено своих']:.0f}, Капитал {df_fixed.iloc[-1]['Общий капитал']:.0f}, Общая прибыль {df_fixed.iloc[-1]['Накопленная прибыль']:.0f}\n\n")
-
-# Агентная система для анализа
-# Сохранение CSV и вычисление сводки до запроса к AI
-df1.to_csv("strategy_deposits.csv", index=False, encoding="utf-8")
-df_fixed.to_csv("strategy_fixed_iis.csv", index=False, encoding="utf-8")
-
-# Вычисляем метрики для краткой сводки
-months = len(df1)
-try:
-    summary1 = summarize_strategy(df1, invested_col='вложено своих', capital_col='капитал на вкладах', profit_col='прибыль (выплаты)', months=months)
-except Exception:
-    summary1 = None
-
-try:
-    summary2 = summarize_strategy(df_fixed, invested_col='Вложено своих', capital_col='Общий капитал', profit_col='Накопленная прибыль', months=months)
-except Exception:
-    summary2 = None
-
-# Попытка создать график сравнения капитала во времени
-if HAS_MATPLOTLIB:
-    try:
-        # График капитала
-        plt.figure(figsize=(10, 6))
-        plt.plot(df1['месяц'], df1['капитал на вкладах'], label='Только вклады', marker='o', linewidth=2)
-        plt.plot(df_fixed['Месяц'], df_fixed['Общий капитал'], label='Вклады + ИИС', marker='s', linewidth=2)
-        plt.xlabel('Месяц')
-        plt.ylabel('Капитал (руб.)')
-        plt.title('Сравнение роста капитала по месяцам')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('capital_comparison.png', dpi=150)
-        plt.close()
-        print('📈 График капитала сохранён: capital_comparison.png')
-
-        # График прибыли (накопленной)
-        plt.figure(figsize=(10, 6))
-        cumulative_profit1 = df1['прибыль (выплаты)'].cumsum()
-        cumulative_profit2 = df_fixed['Накопленная прибыль']
-        plt.plot(df1['месяц'], cumulative_profit1, label='Только вклады', marker='o', linewidth=2)
-        plt.plot(df_fixed['Месяц'], cumulative_profit2, label='Вклады + ИИС', marker='s', linewidth=2)
-        plt.xlabel('Месяц')
-        plt.ylabel('Накопленная прибыль (руб.)')
-        plt.title('Сравнение роста прибыли по месяцам')
-        plt.legend()
-        plt.grid(alpha=0.3)
-        plt.tight_layout()
-        plt.savefig('profit_comparison.png', dpi=150)
-        plt.close()
-        print('📈 График прибыли сохранён: profit_comparison.png')
-
-    except Exception as e:
-        print('⚠️ Не удалось создать графики:', e)
-else:
-    print('ℹ️ matplotlib не найден — графики пропущены')
-
-# Добавляем дополнительные файлы и графики в report.md
-with open("report.md", "a", encoding="utf-8") as f:
-    f.write("## Дополнительные файлы\n\n")
-    f.write("- CSV: strategy_deposits.csv\n")
-    f.write("- CSV: strategy_fixed_iis.csv\n")
-    if HAS_MATPLOTLIB:
-        f.write("- График капитала: capital_comparison.png\n")
-        f.write("- График прибыли: profit_comparison.png\n")
+    Входные данные:
+    - Старт 150 000 руб (январь).
+    - Зарплата 100 000 руб (ежемесячно с февраля).
+    
+    Результаты расчетов:
+    
+    Стратегия 1 (Только вклады, реинвест каждые 3 мес):
+    - Вложено своих: {final_s1['Своих вложено']}
+    - Итоговый капитал: {final_s1['Капитал']}
+    - Чистая прибыль: {final_s1['Прибыль (накопл.)']}
+    
+    Стратегия 2 (Микс Вклады + ИИС ОФЗ с вычетом):
+    - Вложено своих: {final_s2['Своих вложено']}
+    - Итоговый капитал: {final_s2['Капитал']} (включая вычет 52к в конце)
+    
+    Дай короткое резюме: 
+    1. Какая стратегия выгоднее математически и на сколько?
+    2. Какие плюсы у "Только вклады" (ликвидность)?
+    3. Стоит ли заморачиваться с ИИС ради этой разницы на горизонте 1 год?
+    """
+    
+    res = llm.invoke([HumanMessage(content=prompt)])
+    print("\n📝 ОТВЕТ AI:\n")
+    
+    # --- ИСПРАВЛЕНИЕ ОБРАБОТКИ ОТВЕТА ---
+    ai_text = ""
+    
+    # Проверяем, вернулся ли список (структура [{'type': 'text', 'text': '...'}])
+    if isinstance(res.content, list):
+        for part in res.content:
+            if isinstance(part, dict) and 'text' in part:
+                ai_text += part['text']
+            elif isinstance(part, str):
+                ai_text += part
     else:
-        f.write("- Графики: matplotlib недоступен, пропущено\n")
-
-    f.write("## Графики\n\n")
-    if HAS_MATPLOTLIB:
-        f.write("### Сравнение капитала\n\n")
-        f.write("![Сравнение капитала](capital_comparison.png)\n\n")
-        f.write("### Сравнение прибыли\n\n")
-        f.write("![Сравнение прибыли](profit_comparison.png)\n\n")
-    else:
-        f.write("Графики недоступны (matplotlib не установлен).\n\n")
-
-# Добавляем краткую сводку в report.md
-with open("report.md", "a", encoding="utf-8") as f:
-    f.write("\n## Краткая сводка по стратегиям\n\n")
-    if summary1:
-        f.write(f"- **Стратегия 1 (Только вклады)**: вложено {summary1['invested']:.0f}, итоговый капитал {summary1['ending_capital']:.2f}, прибыль {summary1['total_profit']:.2f}, ROI {summary1['roi']:.2%}, CAGR {summary1['cagr']:.2%}\n")
-    else:
-        f.write("- **Стратегия 1 (Только вклады)**: не удалось вычислить сводку\n")
-    if summary2:
-        f.write(f"- **Стратегия 2 (Вклады + ИИС)**: вложено {summary2['invested']:.0f}, итоговый капитал {summary2['ending_capital']:.0f}, прибыль {summary2['total_profit']:.0f}, ROI {summary2['roi']:.2%}, CAGR {summary2['cagr']:.2%}\n")
-    else:
-        f.write("- **Стратегия 2 (Вклады + ИИС)**: не удалось вычислить сводку\n")
-    f.write("\n")
-
-# Конец подготовки данных
-
-if ai_available:
-    parts: List[str] = []
-    parts.append("Проанализируй две инвестиционные стратегии и дай чёткие, практичные выводы.")
-    parts.append("\n\nКраткая сводка по стратегиям:\n")
-    if summary1:
-        parts.append(f"Стратегия 1 (Только вклады): вложено {summary1['invested']:.0f}, итог {summary1['ending_capital']:.2f}, ROI {summary1['roi']:.2%}, CAGR {summary1['cagr']:.2%}.\n")
-    else:
-        parts.append("Стратегия 1: сводка недоступна.\n")
-    if summary2:
-        parts.append(f"Стратегия 2 (Вклады + ИИС): вложено {summary2['invested']:.0f}, итог {summary2['ending_capital']:.0f}, ROI {summary2['roi']:.2%}, CAGR {summary2['cagr']:.2%}.\n\n")
-    else:
-        parts.append("Стратегия 2: сводка недоступна.\n\n")
-    parts.append("Полные таблицы сохранены в файлах: strategy_deposits.csv и strategy_fixed_iis.csv. Отчёт в report.md.")
-    parts.append("\n\nВопросы для анализа (отвечай по пунктам):\n")
-    parts.append("1) Какая стратегия предпочтительнее по итоговому капиталу и почему?\n")
-    parts.append("2) Насколько велика абсолютная и относительная разница в прибыли между стратегиями?\n")
-    parts.append("3) Какие ключевые риски для каждой стратегии (ликвидность, процентный риск, налоговые/регуляторные)?\n")
-    parts.append("4) Какие улучшения/альтернативы вы бы рекомендовали (короткий список действий)?\n")
-    parts.append("5) Дай итоговую рекомендацию для инвестора, ориентированного на капитализацию через год.")
-
-    prompt = "".join(parts)
-
-    response = llm.invoke([HumanMessage(content=prompt)])
-    print("\n🤖 АНАЛИЗ ОТ AI:")
-    # Обработка ответа Gemini (может быть списком)
-    if isinstance(response.content, list) and response.content:
-        ai_text = response.content[0].get('text', str(response.content))
-    else:
-        ai_text = str(response.content)
+        # Если вернулась обычная строка
+        ai_text = str(res.content)
+        
     print(ai_text)
     
-    # Добавить анализ в markdown
-    with open("report.md", "a", encoding="utf-8") as f:
-        f.write("## Анализ от AI\n\n")
-        f.write(ai_text + "\n")
-else:
-    print("\n🤖 AI анализ недоступен (нет API ключа)")
-    with open("report.md", "a", encoding="utf-8") as f:
-        f.write("## Анализ от AI\n\n")
-        f.write("AI анализ недоступен (нет API ключа)\n")
-
-print("\n📄 Отчет сохранен в report.md")
+    # Записываем уже обработанный текст (строку)
+    with open("detailed_report.md", "a", encoding="utf-8") as f:
+        f.write("\n\n## Анализ AI\n")
+        f.write(ai_text)
