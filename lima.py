@@ -67,29 +67,29 @@ def calculate_only_deposits():
     months = 12
     rate = 0.16  # текущая ставка
     
-    # список для хранения открытых вкладов [сумма, месяц_открытия, срок, ставка]
-    deposits = [[start_sum, 0, 5, 0.16]] # завтра в сбер на 5 месяцев
+    # Стартовый капитал (150к) — считаем его уже лежащим на вкладе
+    deposits = [[start_sum, 0, 5, 0.16]] 
     
     history = []
     total_profit = 0
-    total_invested = 150000
+    total_invested = start_sum # Начинаем со 150к
 
     for m in range(months):
-        # 1. добавляем ежемесячное пополнение 100к (со второго месяца)
-        if m > 0:
-            deposits.append([salary_save, m, 3, rate])
-            total_invested += salary_save
+        # 1. Добавляем ежемесячное пополнение 100к (теперь с первого месяца m=0)
+        deposits.append([salary_save, m, 3, rate])
+        total_invested += salary_save
         
-        # 2. проверяем, какие вклады закрылись в этом месяце
+        # 2. Проверяем, какие вклады закрылись в этом месяце
         active_deposits = []
         monthly_profit = 0
         
         for d in deposits:
             sum_val, start_m, duration, d_rate = d
+            # Проверка закрытия
             if m == start_m + duration:
                 profit = sum_val * (d_rate * duration / 12)
                 monthly_profit += profit
-                # реинвестируем: тело + проценты в новый вклад на 3 мес
+                # Реинвестируем тело + проценты на новый срок (3 мес)
                 active_deposits.append([sum_val + profit, m, 3, rate])
             else:
                 active_deposits.append(d)
@@ -103,10 +103,10 @@ def calculate_only_deposits():
             "вложено своих": total_invested,
             "капитал на вкладах": round(current_total, 2),
             "прибыль (выплаты)": round(monthly_profit, 2),
-            "ставка новых вкладов": f"{round(rate*100, 1)}%"
+            "текущая ставка": f"{round(rate*100, 1)}%"
         })
         
-        # Плавное снижение ставки ЦБ на 0.3% каждый месяц
+        # Плавное снижение ставки ЦБ на 0.3%
         rate -= 0.003
 
     return pd.DataFrame(history)
@@ -144,48 +144,53 @@ def calculate_fixed_threshold_strategy():
     months = 12
     rate_vklad = 0.16
     
-    vklads = [[start_sum, 0, 5, 0.16]] # Стартовый Сбер
+    # Стартовый Сбер (150к) уже в списке
+    vklads = [[start_sum, 0, 5, 0.16]] 
     iis_balance = 0
-    total_invested = 150000
+    total_invested = start_sum # Начинаем со 150к базовых
     total_profit_cash = 0
     
     history = []
     
     for m in range(months):
-        if m > 0:
-            total_invested += monthly_save
-            # Чередуем: месяц вклад, месяц ИИС, чтобы соблюсти порог 100к
-            if m % 2 == 0:
-                vklads.append([monthly_save, m, 3, rate_vklad])
-            else:
-                iis_balance += monthly_save
+        # 1. Пополнение происходит КАЖДЫЙ месяц (начиная с m=0)
+        total_invested += monthly_save
         
-        # Обслуживание вкладов
+        # Чередуем: месяц вклад, месяц ИИС
+        if m % 2 == 0:
+            # В 1-й месяц (m=0) докладываем 100к во вклады
+            vklads.append([monthly_save, m, 3, rate_vklad])
+        else:
+            # Во 2-й месяц (m=1) отправляем 100к на ИИС
+            iis_balance += monthly_save
+        
+        # 2. Обслуживание вкладов (проверка закрытия и реинвест)
         new_vklads = []
-        monthly_profit = 0
+        monthly_profit_vklad = 0
         for v in vklads:
             v_sum, v_start, v_dur, v_rate = v
             if m == v_start + v_dur:
                 p = v_sum * (v_rate * v_dur / 12)
-                monthly_profit += p
-                # Реинвестируем (сумма точно > 100к, так как тело уже 100к)
+                monthly_profit_vklad += p
+                # Реинвестируем тело + проценты
                 new_vklads.append([v_sum + p, m, 3, rate_vklad])
             else:
                 new_vklads.append(v)
         vklads = new_vklads
-        total_profit_cash += monthly_profit
+        total_profit_cash += monthly_profit_vklad
         
-        # Купоны по ОФЗ (15% годовых / 12 мес)
+        # 3. Купоны по ОФЗ (начисляются на текущий баланс ИИС)
         monthly_coupon = iis_balance * (0.15 / 12)
         total_profit_cash += monthly_coupon
         
+        # 4. Расчет итогов месяца
         current_vklad_total = sum(v[0] for v in vklads)
-        # В декабре добавляем рост цены ОФЗ (+8% на весь накопленный объем)
-        current_iis_value = iis_balance + (iis_balance * 0.08 if m == 11 else 0)
         
-        # В конце года добавляем налоговый вычет 52к
-        tax_refund = 52000 if m == 11 else 0
-        total_profit_cash += tax_refund
+        # Рост тела ОФЗ (+8%) и вычет (52к) в конце года (декабрь, m=11)
+        current_iis_value = iis_balance
+        if m == 11:
+            current_iis_value += iis_balance * 0.08
+            total_profit_cash += 52000 # Налоговый вычет
         
         history.append({
             "Месяц": m + 1,
@@ -195,10 +200,11 @@ def calculate_fixed_threshold_strategy():
             "Общий капитал": round(current_vklad_total + current_iis_value, 0),
             "Накопленная прибыль": round(total_profit_cash, 0)
         })
+        
+        # Плавное снижение ставки
         rate_vklad -= 0.003
 
     return pd.DataFrame(history)
-
 df1 = calculate_only_deposits()
 print("СТРАТЕГИЯ 1: ТОЛЬКО ВКЛАДЫ")
 print(df1.to_string(index=False))
