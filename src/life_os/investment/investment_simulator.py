@@ -307,14 +307,14 @@ print("\n🟠 СТРАТЕГИЯ 2: СМЕШАННАЯ (Вклады + ИИС)")
 print(df2[['Дата', 'Своих вложено', 'На вкладах', 'На ИИС', 'Капитал', 'События']].to_string(index=False))
 
 # Сохранение в файл
-with open("detailed_report.md", "w", encoding="utf-8") as f:
+with open(os.path.join("reports", "detailed_report.md"), "w", encoding="utf-8") as f:
     f.write("# Детальный расчет инвестиций\n\n")
     f.write("## Стратегия 1: Каскад вкладов\n")
     f.write(df1.to_markdown(index=False))
     f.write("\n\n## Стратегия 2: Вклады + ИИС\n")
     f.write(df2.to_markdown(index=False))
 
-print(f"\n💾 Полный отчет сохранен в detailed_report.md")
+print(f"\n💾 Полный отчет сохранен в reports/detailed_report.md")
 
 # AI Анализ (если доступен ключ)
 if HAS_AI:
@@ -389,6 +389,6 @@ if HAS_AI:
     print(ai_text)
     
     # Записываем уже обработанный текст (строку)
-    with open("detailed_report.md", "a", encoding="utf-8") as f:
+    with open(os.path.join("reports", "detailed_report.md"), "a", encoding="utf-8") as f:
         f.write("\n\n## Анализ AI\n")
         f.write(ai_text)
